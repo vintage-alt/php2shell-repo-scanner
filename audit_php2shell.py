@@ -1,19 +1,15 @@
 import os
+import time
 import requests
 import base64
 import yaml
 import json
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-# Options for GITHUB_ORG:
-# 1. Leave blank/unset -> Scans personal account only
-# 2. Set to 'all' -> Automatically discovers and scans your personal account + all your organizations
-# 3. Set to comma-separated list -> e.g., "company-org-a,company-org-b"
 GITHUB_ORG = os.getenv("GITHUB_ORG", "").strip()
 HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 # Vulnerability thresholds for PHP2Shell (CVE-2026-109618, CVE-2026-109619)
-# Fixed minimum patch versions: 8.2.35, 8.3.36, 8.4.27, 8.5.12
 SAFE_PHP_VERSIONS = {
     (8, 2): 35,
     (8, 3): 36,
@@ -22,7 +18,6 @@ SAFE_PHP_VERSIONS = {
 }
 
 def is_php_version_vulnerable(version_str):
-    """Parses a PHP version string and checks if it falls below the safe patch threshold."""
     clean_v = version_str.strip().lstrip('v').split('-')[0]
     parts = clean_v.split('.')
     try:
@@ -30,10 +25,10 @@ def is_php_version_vulnerable(version_str):
         minor = int(parts[1]) if len(parts) > 1 else 0
         patch = int(parts[2]) if len(parts) > 2 else 0
     except ValueError:
-        return True # Unknown format, flag safely
+        return True 
 
     if major < 8:
-        return True # PHP 8.1 and older are unpatched / EOL
+        return True 
         
     version_key = (major, minor)
     if version_key in SAFE_PHP_VERSIONS:
@@ -42,12 +37,26 @@ def is_php_version_vulnerable(version_str):
             return True
         return False
         
-    return True # Newer or unhandled minor branches default safely
+    return True 
+
+def safe_get(url):
+    """Wrapper to make requests safely with timeouts, rate-limit catching, and error handling."""
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        # Check if GitHub is rate-limiting or triggering secondary limits
+        if res.status_code in [403, 429]:
+            print(f"\n[!] Rate limit or secondary throttle hit on {url}. Backing off for 10 seconds...")
+            time.sleep(10)
+            # Retry once
+            res = requests.get(url, headers=HEADERS, timeout=10)
+        return res
+    except requests.exceptions.RequestException:
+        return None
 
 def get_file_content(repo_full_name, path):
     url = f"https://api.github.com/repos/{repo_full_name}/contents/{path}"
-    res = requests.get(url, headers=HEADERS)
-    if res.status_code == 200:
+    res = safe_get(url)
+    if res and res.status_code == 200:
         content_b64 = res.json().get("content", "")
         try:
             return base64.b64decode(content_b64).decode('utf-8')
@@ -74,8 +83,8 @@ def extract_php_versions_from_workflow(data):
 def scan_github_actions(repo):
     findings = []
     url = f"https://api.github.com/repos/{repo}/contents/.github/workflows"
-    res = requests.get(url, headers=HEADERS)
-    if res.status_code == 200:
+    res = safe_get(url)
+    if res and res.status_code == 200:
         files = res.json()
         if isinstance(files, list):
             for file in files:
@@ -138,8 +147,9 @@ def fetch_paginated_repos(url):
     page = 1
     while True:
         target_url = f"{url}&page={page}&per_page=100" if "?" in url else f"{url}?page={page}&per_page=100"
-        res = requests.get(target_url, headers=HEADERS)
-        if res.status_code != 200:
+        print(f"Fetching repo page {page} from {url.split('//')[1].split('/')[0]}...")
+        res = safe_get(target_url)
+        if not res or res.status_code != 200:
             break
         data = res.json()
         if not data or not isinstance(data, list):
@@ -156,8 +166,8 @@ def main():
     
     if GITHUB_ORG.lower() == "all":
         print("Auto-discovering organizations for the authenticated user...")
-        orgs_res = requests.get("https://api.github.com/user/orgs", headers=HEADERS)
-        if orgs_res.status_code == 200:
+        orgs_res = safe_get("https://api.github.com/user/orgs")
+        if orgs_res and orgs_res.status_code == 200:
             orgs = orgs_res.json()
             targets = [o['login'] for o in orgs]
             print(f"Found organizations: {', '.join(targets)}")
@@ -180,13 +190,18 @@ def main():
     
     repo_results = {}
     vulnerable_repo_count = 0
-    for repo in repos:
+    
+    for i, repo in enumerate(repos):
+        print(f"Scanning [{i+1}/{len(repos)}]: {repo}")
         findings = scan_repository(repo)
         if findings:
             has_vuln = any(status == "vulnerable" for status, _ in findings)
             if has_vuln:
                 vulnerable_repo_count += 1
             repo_results[repo] = (has_vuln, findings)
+        
+        # Polite delay to prevent triggering GitHub secondary rate limits
+        time.sleep(0.2)
 
     target_display = GITHUB_ORG if GITHUB_ORG else "Personal User Account"
     
@@ -194,7 +209,7 @@ def main():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PHP2Shell (CVE-2026-109618, CVE-2026-109619) Audit Report</title>
+    <title>PHP2Shell Audit Report (CVE-2026-109618 / CVE-2026-109619)</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; color: #333; margin: 0; padding: 20px; }}
         .container {{ max-width: 900px; margin: auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
@@ -301,7 +316,7 @@ def main():
 
     with open("php2shell_report.html", "w", encoding="utf-8") as f:
         f.write(html_content)
-    print("Audit complete! HTML report saved to php2shell_report.html")
+    print("\nAudit complete! HTML report saved to php2shell_report.html")
 
 if __name__ == "__main__":
     main()
